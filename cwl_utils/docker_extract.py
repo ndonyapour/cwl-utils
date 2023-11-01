@@ -3,6 +3,9 @@
 import argparse
 import os
 import sys
+import tempfile 
+import subprocess
+import shutil
 from typing import Iterator, List, cast
 
 import ruamel.yaml
@@ -42,6 +45,10 @@ def arg_parser() -> argparse.ArgumentParser:
     )
     return parser
 
+def create_tmp_dir(tmpdir_prefix: str) -> str:
+    """Create a temporary directory that respects the given tmpdir_prefix."""
+    tmp_dir, tmp_prefix = os.path.split(tmpdir_prefix)
+    return tempfile.mkdtemp(prefix=tmp_prefix, dir=tmp_dir)
 
 def run(args: argparse.Namespace) -> List[cwl.DockerRequirement]:
     """Extract the docker reqs and download them using Singularity or Docker."""
@@ -51,13 +58,58 @@ def run(args: argparse.Namespace) -> List[cwl.DockerRequirement]:
 
     if args.dir:
         os.makedirs(args.dir, exist_ok=True)
-
     top = cwl.load_document_by_uri(args.input)
     reqs: List[cwl.DockerRequirement] = []
-
     for req in traverse(top):
+        # import ipdb
+        # ipdb.set_trace()
         reqs.append(req)
-        if not req.dockerPull:
+        if req.dockerFile or req.dockerImageId:
+            dockerfile_dir = create_tmp_dir(args.dir)
+            with open(os.path.join(dockerfile_dir, "Dockerfile"), "w") as dfile:
+                dfile.write(req.dockerFile)
+            cmd = [
+                "spython",
+                "recipe",
+                os.path.join(dockerfile_dir, "Dockerfile"),
+                os.path.join(dockerfile_dir, "Singularity.def"),
+            ]
+            print("Do conversion")
+            
+            subprocess.run(  # nosec
+                cmd, check=True , stdout=sys.stdout, stderr=sys.stdout
+            )
+            cmd = [
+                "singularity",
+                "build",
+                os.path.join(args.dir, f'{str(req.dockerImageId)}'),
+                os.path.join(dockerfile_dir, "Singularity.def"),
+                ]
+            subprocess.run(  # nosec
+                cmd, check=True, stdout=sys.stdout, stderr=sys.stdout #stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            )
+            shutil.rmtree(dockerfile_dir)
+        elif req.dockerPull:
+            if args.singularity:
+                image_puller: ImagePuller = SingularityImagePuller(
+                    req.dockerPull,
+                    args.dir,
+                    args.container_engine
+                    if args.container_engine is not None
+                    else "singularity",
+                    args.force_download,
+                )
+            else:
+                image_puller = DockerImagePuller(
+                    req.dockerPull,
+                    args.dir,
+                    args.container_engine
+                    if args.container_engine is not None
+                    else "docker",
+                    args.force_download,
+                )
+            image_puller.save_docker_image()
+        else:
             print(
                 "Unable to save image from due to lack of 'dockerPull':",
                 file=sys.stderr,
@@ -65,25 +117,6 @@ def run(args: argparse.Namespace) -> List[cwl.DockerRequirement]:
             yaml = ruamel.yaml.YAML()
             yaml.dump(req.save(), sys.stderr)
             continue
-        if args.singularity:
-            image_puller: ImagePuller = SingularityImagePuller(
-                req.dockerPull,
-                args.dir,
-                args.container_engine
-                if args.container_engine is not None
-                else "singularity",
-                args.force_download,
-            )
-        else:
-            image_puller = DockerImagePuller(
-                req.dockerPull,
-                args.dir,
-                args.container_engine
-                if args.container_engine is not None
-                else "docker",
-                args.force_download,
-            )
-        image_puller.save_docker_image()
     return reqs
 
 
